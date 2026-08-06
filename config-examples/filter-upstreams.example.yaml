@@ -1,0 +1,22 @@
+# Example snippet for hermes-open-webui-adapter (hermes_tool_filter).
+# Full project: https://github.com/uraniumchonk/hermes-open-webui-adapter
+#
+# Open WebUI connection URL shape:
+#   http://<filter-host>:9099/<port>/v1
+# maps to upstreams["<port>"].
+
+upstreams:
+  "30001": "http://127.0.0.1:30001"   # example: coder profile gateway
+  "30005": "http://127.0.0.1:30005"   # example: family profile gateway
+
+# structured = OpenAI-native assistant.tool_calls + role=tool (recommended)
+tool_history_format: "structured"
+
+enable_history_sanitization: true
+sanitization_result_max_length: 20000
+
+# enhance-v2 = live SSE + <details> tool cards for Open WebUI
+tool_mode: "enhance-v2"
+
+bind_host: "0.0.0.0"
+bind_port: 9099

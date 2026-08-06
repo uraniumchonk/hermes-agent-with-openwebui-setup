@@ -1,0 +1,28 @@
+--- /home/user/owui-migration/patches/misc.official.0.10.2.py	2026-08-06 19:22:56.272136092 +0800
++++ /home/user/openwebui/lib/python3.12/site-packages/open_webui/utils/misc.py	2026-08-02 15:04:07.829254662 +0800
+@@ -164,7 +164,24 @@
+             if item['type'] == 'text':
+                 return item['text']
+     else:
+-        return message.get('content')
++        content = message.get('content')
++        if content:
++            return content
++    
++    # Fallback: extract from output field when content is empty
++    # This handles assistant messages where the real text is stored in output
++    output = message.get('output')
++    if isinstance(output, list) and output:
++        for item in output:
++            if isinstance(item, dict):
++                item_content = item.get('content')
++                if isinstance(item_content, list):
++                    for sub_item in item_content:
++                        if isinstance(sub_item, dict) and sub_item.get('type') == 'output_text':
++                            return sub_item.get('text')
++                elif isinstance(item_content, str) and item_content:
++                    return item_content
++    
+     return None
+ 
+ 

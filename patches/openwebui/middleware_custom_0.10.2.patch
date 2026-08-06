@@ -1,0 +1,732 @@
+--- /home/user/owui-migration/patches/middleware.official.0.10.2.py	2026-08-06 19:22:55.935134304 +0800
++++ /home/user/openwebui/lib/python3.12/site-packages/open_webui/utils/middleware.py	2026-08-06 19:36:24.344860187 +0800
+@@ -7,11 +7,15 @@
+ import logging
+ import os
+ import random
++import hashlib
++import mimetypes
+ import re
++import shutil
+ import sys
+ import textwrap
+ import time
+ from concurrent.futures import ThreadPoolExecutor
++from pathlib import Path
+ from typing import Any, Optional
+ from uuid import uuid4
+ 
+@@ -41,6 +45,7 @@
+ )
+ from open_webui.models.chats import Chats
+ from open_webui.models.config import Config
++from open_webui.models.files import Files
+ from open_webui.models.folders import Folders
+ from open_webui.models.functions import Functions
+ from open_webui.models.models import Models
+@@ -80,6 +85,7 @@
+ from open_webui.utils.files import (
+     convert_markdown_base64_images,
+     get_file_url_from_base64,
++    get_image_base64_from_file_id,
+     get_image_base64_from_url,
+     get_image_url_from_base64,
+ )
+@@ -1545,6 +1551,15 @@
+         if not files_with_urls:
+             continue
+ 
++        # Hermes custom: 只處理圖片檔案，非圖片檔案由 inject_document_file_paths 處理
++        files_with_urls = [
++            file for file in files_with_urls
++            if file.get('type') == 'image'
++            or file.get('content_type', '').startswith('image/')
++        ]
++        if not files_with_urls:
++            continue
++
+         file_tags = [format_file_tag(file) for file in files_with_urls]
+         file_context = '<attached_files>\n' + '\n'.join(file_tags) + '\n</attached_files>\n\n'
+ 
+@@ -1921,6 +1936,558 @@
+     return form_data
+ 
+ 
++
++# --- File cache + path injection for Hermes agent ---
++# Supports: images (vision_analyze) + documents (read_file)
++IMAGE_CACHE_DIR = Path('/home/user/openwebui/data/image_cache')
++IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
++
++FILE_CACHE_DIR = Path('/home/user/openwebui/data/file_cache')
++FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
++
++from datetime import datetime
++
++# 同一則「當下」user message 的 timestamp 必須跨 agent multi-step / 重試 固定。
++# 禁止每次 request 都 datetime.now() 重戳，否則會打穿 vLLM/LMCache prefix cache。
++_IMAGE_INJECT_TS_DIR = IMAGE_CACHE_DIR / '.inject_ts'
++_IMAGE_INJECT_TS_DIR.mkdir(parents=True, exist_ok=True)
++_IMAGE_INJECT_TS_MEM: dict[str, str] = {}
++
++
++def _message_inject_key(message: dict, cached_path: str) -> str:
++    """Stable key for one (message, image path) pair."""
++    msg_id = message.get('id') or message.get('message_id') or ''
++    if not msg_id:
++        urls: list[str] = []
++        content = message.get('content')
++        if isinstance(content, list):
++            for item in content:
++                if isinstance(item, dict) and item.get('type') == 'image_url':
++                    url = (item.get('image_url') or {}).get('url', '')
++                    # data: URLs are huge; fingerprint prefix + length
++                    if isinstance(url, str) and url.startswith('data:'):
++                        urls.append(f'data:{len(url)}:{url[:64]}')
++                    else:
++                        urls.append(str(url)[:240])
++        msg_id = hashlib.md5('|'.join(urls).encode('utf-8', errors='replace')).hexdigest()
++    return hashlib.md5(f'{msg_id}|{cached_path}'.encode('utf-8', errors='replace')).hexdigest()
++
++
++def _get_or_create_inject_ts(message: dict, cached_path: str) -> str:
++    """First stamp wins for this message+path; later requests reuse it."""
++    key = _message_inject_key(message, str(cached_path))
++    if key in _IMAGE_INJECT_TS_MEM:
++        return _IMAGE_INJECT_TS_MEM[key]
++    ts_path = _IMAGE_INJECT_TS_DIR / f'{key}.txt'
++    try:
++        if ts_path.exists():
++            ts = ts_path.read_text(encoding='utf-8').strip()
++            if ts:
++                _IMAGE_INJECT_TS_MEM[key] = ts
++                return ts
++    except Exception as e:
++        log.debug(f'read inject ts failed: {e}')
++    ts = datetime.now().strftime('%Y-%m-%dT%H:%M:%S')
++    _IMAGE_INJECT_TS_MEM[key] = ts
++    try:
++        ts_path.write_text(ts, encoding='utf-8')
++    except Exception as e:
++        log.debug(f'write inject ts failed: {e}')
++    return ts
++
++
++def _extract_file_id_from_url(url: str) -> str | None:
++    """從 Open WebUI 檔案 URL 中提取 file_id。
++    
++    URL 格式可能為:
++    - http://localhost:8080/api/v1/uploads/file_id/filename.jpg
++    - /api/v1/uploads/file_id/filename.jpg
++    - http://localhost:8080/files/file_id/view
++    - /files/file_id/view
++    """
++    # Pattern 1: /uploads/{file_id}/...
++    m = re.search(r'/uploads/([a-f0-9-]+)/', url)
++    if m:
++        return m.group(1)
++    
++    # Pattern 2: /files/{file_id}/...
++    m = re.search(r'/files/([a-f0-9-]+)/', url)
++    if m:
++        return m.group(1)
++    
++    # Pattern 3: 直接是 UUID（有時 URL 就是 file_id 本身）
++    m = re.search(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}', url)
++    if m:
++        return m.group(0)
++    
++    return None
++
++
++def _get_ext_from_content_type(content_type: str) -> str:
++    """從 content_type 推導副檔名。"""
++    ext_map = {
++        # Images
++        'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
++        'image/webp': '.webp', 'image/gif': '.gif', 'image/bmp': '.bmp',
++        'image/svg+xml': '.svg',
++        # Documents
++        'application/pdf': '.pdf',
++        'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx',
++        'application/msword': '.doc',
++        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': '.xlsx',
++        'application/vnd.ms-excel': '.xls',
++        'application/vnd.openxmlformats-officedocument.presentationml.presentation': '.pptx',
++        'application/vnd.ms-powerpoint': '.ppt',
++        # Text
++        'text/plain': '.txt', 'text/csv': '.csv', 'text/html': '.html',
++        'text/markdown': '.md', 'application/json': '.json',
++        'text/xml': '.xml', 'application/xml': '.xml',
++        # Code
++        'text/javascript': '.js', 'text/css': '.css',
++        'application/x-python-code': '.py',
++    }
++    return ext_map.get(content_type, '.bin')
++
++
++async def cache_file_from_file_id(file_id: str, user=None, is_image=False) -> str | None:
++    """從 Open WebUI file store 複製檔案到本地快取，回傳絕對路徑。
++    
++    Args:
++        file_id: Open WebUI 檔案的 UUID
++        user: 當前用戶（用於權限檢查）
++        is_image: 是否為圖片（決定快取目錄）
++    
++    Returns:
++        快取後的絕對路徑，失敗時返回 None
++    """
++    try:
++        file_info = await Files.get_file_by_id(file_id)
++        if not file_info:
++            log.debug(f'File not found in DB: {file_id}')
++            return None
++        
++        # 檢查擁有者
++        if user and file_info.user_id:
++            if hasattr(user, 'id') and file_info.user_id != user.id:
++                # 也允許 admin
++                if not hasattr(user, 'role') or user.role != 'admin':
++                    log.debug(f'File {file_id} belongs to different user')
++                    return None
++        
++        # 取得來源路徑
++        source_path = getattr(file_info, 'path', None)
++        if not source_path:
++            log.debug(f'File {file_id} has no path')
++            return None
++        
++        # 使用 Storage provider 取得實際檔案路徑
++        try:
++            from open_webui.storage.provider import Storage
++            import asyncio
++            source_path = await asyncio.to_thread(Storage.get_file, source_path)
++        except Exception:
++            pass  # 如果 Storage.get_file 失敗，直接用原始 path
++        
++        if not source_path or not os.path.exists(source_path):
++            log.debug(f'File source not found: {source_path}')
++            return None
++        
++        # 決定副檔名
++        ext = '.bin'
++        meta = getattr(file_info, 'meta', None)
++        if isinstance(meta, dict) and meta.get('content_type'):
++            ext = _get_ext_from_content_type(meta['content_type'])
++        elif getattr(file_info, 'filename', None):
++            _, e = os.path.splitext(file_info.filename)
++            if e:
++                ext = e
++        
++        # 選擇快取目錄
++        cache_dir = IMAGE_CACHE_DIR if is_image else FILE_CACHE_DIR
++        
++        # 複製到快取
++        cached_path = cache_dir / f"{file_id}{ext}"
++        shutil.copy2(source_path, str(cached_path))
++        log.debug(f'Cached file {file_id} -> {cached_path}')
++        return str(cached_path)
++    except Exception as e:
++        log.debug(f'Error caching file from file_id {file_id}: {e}')
++        return None
++
++
++# Keep backward compatibility for existing code
++async def cache_image_from_file_id(file_id: str, user=None) -> str | None:
++    """Resolve image path. Prefer OWUI uploads (DB path); cache copy is last resort."""
++    return await _resolve_document_local_path(
++        {'id': file_id, 'url': file_id, 'type': 'image'},
++        user=user,
++    )
++
++
++async def inject_image_file_paths(form_data, user=None):
++    """把 image_url parts 替換為本地檔案路徑文字。
++
++    策略：
++    - **僅**「當下最後一則 user message」中的圖片：注入 path + 固定 timestamp
++    - 有 file_id → **優先 OWUI uploads/**（DB file.path，單一真相來源）
++    - data:image/ base64 → 才寫入 image_cache/（uploads 沒有的 ephemeral）
++    - 歷史 user message：穩定 placeholder，**永不 restamp**
++
++    重要（prefix cache）：
++    - 禁止用「最後一則含圖訊息」當 is_latest
++    - timestamp 只允許出現在「當下最後一則 user message」，且同一 message+path 首次固定
++
++    注意：image_url → text，避免 convert_url_images_to_base64 再塞 base64。
++    """
++    messages = form_data.get('messages', [])
++    if not messages:
++        return form_data
++
++    # 當下最新 user 訊息索引（不是「最後一則含圖」）
++    latest_user_msg_idx = None
++    for i in range(len(messages) - 1, -1, -1):
++        if messages[i].get('role') == 'user':
++            latest_user_msg_idx = i
++            break
++
++    for msg_idx, message in enumerate(messages):
++        content = message.get('content')
++        if not isinstance(content, list):
++            continue
++
++        image_parts = [
++            item for item in content
++            if isinstance(item, dict) and item.get('type') == 'image_url'
++        ]
++        if not image_parts:
++            continue
++
++        is_current_user_turn = (msg_idx == latest_user_msg_idx)
++        num_images = len(image_parts)
++
++        new_content = []
++        image_counter = 0
++
++        text_parts = [item for item in content if isinstance(item, dict) and item.get('type') == 'text']
++        has_text = len(text_parts) > 0
++
++        for item in content:
++            if not isinstance(item, dict) or item.get('type') != 'image_url':
++                if isinstance(item, dict):
++                    new_content.append(dict(item))
++                else:
++                    new_content.append(item)
++                continue
++
++            image_counter += 1
++
++            if is_current_user_turn:
++                url_val = item.get('image_url', {}).get('url', '')
++                local_path = None
++                source_kind = None
++
++                if isinstance(url_val, str) and url_val.startswith('data:image/'):
++                    # Ephemeral base64 only — uploads has no row for this blob
++                    try:
++                        header, b64_data = url_val.split(',', 1)
++                        mime_part = header.split(';')[0].split(':')[1]
++                        ext_map_rev = {
++                            'image/png': '.png', 'image/jpeg': '.jpg', 'image/jpg': '.jpg',
++                            'image/webp': '.webp', 'image/gif': '.gif',
++                        }
++                        ext = ext_map_rev.get(mime_part, '.jpg')
++                        import base64 as b64mod
++                        cache_name = f"data_{hashlib.md5(b64_data.encode()).hexdigest()}{ext}"
++                        cache_path = IMAGE_CACHE_DIR / cache_name
++                        if not cache_path.exists():
++                            with open(cache_path, 'wb') as f:
++                                f.write(b64mod.b64decode(b64_data))
++                        local_path = str(cache_path)
++                        source_kind = 'image_cache'
++                        log.debug(f'Ephemeral base64 image -> {local_path}')
++                    except Exception as e:
++                        log.debug(f'Error caching base64 image: {e}')
++                        new_content.append(item)
++                        continue
++                else:
++                    file_id = _extract_file_id_from_url(str(url_val or ''))
++                    if file_id:
++                        # Prefer uploads via DB path — do NOT dual-write image_cache
++                        local_path = await _resolve_document_local_path(
++                            {'id': file_id, 'url': file_id, 'type': 'image'},
++                            user=user,
++                        )
++                        if local_path:
++                            source_kind = 'uploads'
++                            log.debug(f'Image {file_id} -> {local_path} ({source_kind})')
++                        else:
++                            new_content.append(item)
++                            continue
++                    else:
++                        # Unknown URL shape — leave for convert_url_images_to_base64
++                        new_content.append(item)
++                        continue
++
++                try:
++                    file_size = os.path.getsize(local_path)
++                    file_ext = Path(local_path).suffix.lower()
++                    if file_size < 1024:
++                        size_str = f'{file_size}B'
++                    elif file_size < 1024 * 1024:
++                        size_str = f'{file_size / 1024:.1f}KB'
++                    else:
++                        size_str = f'{file_size / (1024 * 1024):.1f}MB'
++                except Exception:
++                    size_str = 'unknown'
++                    file_ext = Path(local_path).suffix.lower() if local_path else ''
++
++                image_filename = Path(local_path).name
++                # Pi cold-backup mirror (uploads + ephemeral cache). 9098 may serve basename.
++                remote_url = f'http://192.168.0.150:9098/file/{image_filename}'
++                ts = _get_or_create_inject_ts(message, str(local_path))
++
++                if num_images == 1:
++                    image_desc = (
++                        f'\n\n---\n'
++                        f'📎 Image: {local_path} ({file_ext}, {size_str})\n'
++                        f'🔹 Local: call vision_analyze(path="{local_path}")\n'
++                        f'🔹 Remote: if you cannot access local path, download from {remote_url} then analyze it.\n'
++                        f'⚠️ IMPORTANT: Prepend this timestamp to the "question" field: "[{ts}] " to ensure KV cache uniqueness.\n'
++                        f'---\n\n'
++                    )
++                else:
++                    image_desc = (
++                        f'\n\n---\n'
++                        f'📎 Image {image_counter}/{num_images}: {local_path} ({file_ext}, {size_str})\n'
++                        f'🔹 Local: call vision_analyze(path="{local_path}")\n'
++                        f'🔹 Remote: if you cannot access local path, download from {remote_url} then analyze it.\n'
++                        f'⚠️ IMPORTANT: Prepend this timestamp to the "question" field: "[{ts}] " to ensure KV cache uniqueness.\n'
++                        f'---\n\n'
++                    )
++
++                if not has_text and image_counter == 1:
++                    image_desc = '[No text — use vision_analyze to view attached image]\n\n' + image_desc
++
++                new_content.append({'type': 'text', 'text': image_desc})
++            else:
++                # 歷史訊息：穩定 placeholder
++                new_content.append({
++                    'type': 'text',
++                    'text': f'[Image: {num_images} image(s) attached]',
++                })
++
++        message['content'] = new_content
++
++    return form_data
++
++
++def _is_image_file_item(file: dict) -> bool:
++    if not isinstance(file, dict):
++        return False
++    return file.get('type') == 'image' or str(file.get('content_type') or '').startswith('image/')
++
++
++def _collect_request_file_items(form_data: dict) -> list[dict]:
++    """Gather attachment dicts from every place Open WebUI may stash them."""
++    items: list[dict] = []
++    metadata = form_data.get('metadata') or {}
++    for src in (
++        metadata.get('files'),
++        form_data.get('files'),
++    ):
++        if isinstance(src, list):
++            items.extend([f for f in src if isinstance(f, dict)])
++
++    for message in form_data.get('messages') or []:
++        if not isinstance(message, dict):
++            continue
++        msg_files = message.get('files')
++        if isinstance(msg_files, list):
++            items.extend([f for f in msg_files if isinstance(f, dict)])
++        for aid in message.get('attachment_ids') or []:
++            if isinstance(aid, str) and aid:
++                items.append({'id': aid, 'type': 'file', 'url': aid})
++
++    # Dedupe by file id / url
++    seen: set[str] = set()
++    unique: list[dict] = []
++    for f in items:
++        key = str(f.get('id') or f.get('url') or f.get('path') or id(f))
++        if key in seen:
++            continue
++        seen.add(key)
++        unique.append(f)
++    return unique
++
++
++async def _resolve_document_local_path(file: dict, user=None) -> str | None:
++    """Resolve a readable on-disk path for a non-image attachment.
++
++    Prefer the server upload path already stored in DB (no extra cache copy).
++    Fall back to cache_file_from_file_id only if the primary path is missing.
++    """
++    # Direct path on the item (rare but cheap)
++    direct = file.get('path')
++    if isinstance(direct, str) and direct and os.path.exists(direct):
++        return direct
++
++    url = str(file.get('url') or '')
++    file_id = file.get('id') or (_extract_file_id_from_url(url) if url and not url.startswith('data:') else None)
++    if not file_id:
++        return None
++
++    try:
++        file_info = await Files.get_file_by_id(file_id)
++        if not file_info:
++            log.info(f'inject_document: file not in DB id={file_id}')
++            return None
++
++        if user and file_info.user_id and hasattr(user, 'id') and file_info.user_id != user.id:
++            if not hasattr(user, 'role') or user.role != 'admin':
++                log.info(f'inject_document: permission denied id={file_id}')
++                return None
++
++        source_path = getattr(file_info, 'path', None)
++        if source_path:
++            try:
++                from open_webui.storage.provider import Storage
++                import asyncio
++
++                source_path = await asyncio.to_thread(Storage.get_file, source_path)
++            except Exception:
++                pass
++
++        if source_path and os.path.exists(source_path):
++            return str(source_path)
++
++        # Fallback: optional copy into file_cache (legacy behaviour)
++        return await cache_file_from_file_id(file_id, user=user, is_image=False)
++    except Exception as e:
++        log.info(f'inject_document: resolve failed id={file_id}: {e}')
++        return None
++
++
++async def inject_document_file_paths(form_data, user=None):
++    """Intercept non-image attachments and inject local path text for Hermes.
++
++    Sources (Open WebUI 0.10.x scatters these):
++      - form_data['metadata']['files']  (set late in process_chat_payload)
++      - form_data['files']
++      - messages[*].files / attachment_ids
++
++    Strategy:
++      - Prefer the existing uploads/ path from the file DB (no mandatory cache copy)
++      - Inject path + read_file instructions into the latest user message
++      - Strip non-image entries from metadata/form files so native RAG does not
++        re-inject extracted text and bloat the prompt
++    """
++    all_files = _collect_request_file_items(form_data)
++    if not all_files:
++        return form_data
++
++    doc_files = [f for f in all_files if not _is_image_file_item(f)]
++    if not doc_files:
++        return form_data
++
++    # Strip non-image files from metadata / form_data so RAG won't re-process them
++    metadata = form_data.get('metadata')
++    if isinstance(metadata, dict):
++        meta_files = metadata.get('files')
++        if isinstance(meta_files, list):
++            metadata['files'] = [f for f in meta_files if isinstance(f, dict) and _is_image_file_item(f)]
++            form_data['metadata'] = metadata
++
++    top_files = form_data.get('files')
++    if isinstance(top_files, list):
++        form_data['files'] = [f for f in top_files if isinstance(f, dict) and _is_image_file_item(f)]
++
++    messages = form_data.get('messages', [])
++    if not messages:
++        return form_data
++
++    latest_user_msg = None
++    for msg in reversed(messages):
++        if isinstance(msg, dict) and msg.get('role') == 'user':
++            latest_user_msg = msg
++            break
++    if not latest_user_msg:
++        return form_data
++
++    # Also strip files off messages (keep images only if any remain)
++    for msg in messages:
++        if not isinstance(msg, dict) or not isinstance(msg.get('files'), list):
++            continue
++        kept = [f for f in msg['files'] if isinstance(f, dict) and _is_image_file_item(f)]
++        if kept:
++            msg['files'] = kept
++        else:
++            msg.pop('files', None)
++
++    file_descriptions: list[str] = []
++    resolved_paths: list[str] = []
++    for file_idx, file in enumerate(doc_files, 1):
++        filename = file.get('name') or file.get('filename') or f'file_{file_idx}'
++        local_path = await _resolve_document_local_path(file, user=user)
++        if not local_path:
++            log.info(f'inject_document: skip unresolved file name={filename} id={file.get("id")}')
++            continue
++
++        try:
++            file_size = os.path.getsize(local_path)
++            file_ext = Path(local_path).suffix.lower()
++            if file_size < 1024:
++                size_str = f'{file_size}B'
++            elif file_size < 1024 * 1024:
++                size_str = f'{file_size / 1024:.1f}KB'
++            else:
++                size_str = f'{file_size / (1024 * 1024):.1f}MB'
++        except Exception:
++            size_str = 'unknown'
++            file_ext = Path(local_path).suffix.lower()
++
++        # Keep remote hint for agents not on meowhome; primary is local path.
++        remote_url = f'http://192.168.0.150:9098/file/{Path(local_path).name}'
++        if len(doc_files) == 1:
++            file_desc = (
++                f'\n\n---\n'
++                f'📎 File: {local_path} ({file_ext}, {size_str})\n'
++                f'🔹 Local: call read_file(path="{local_path}")\n'
++                f'🔹 Remote: if you cannot access local path, download from {remote_url} then read it.\n'
++                f'---\n\n'
++            )
++        else:
++            file_desc = (
++                f'\n\n---\n'
++                f'📎 File {file_idx}/{len(doc_files)}: {local_path} ({file_ext}, {size_str})\n'
++                f'🔹 Local: call read_file(path="{local_path}")\n'
++                f'🔹 Remote: if you cannot access local path, download from {remote_url} then read it.\n'
++                f'---\n\n'
++            )
++        file_descriptions.append(file_desc)
++        resolved_paths.append(local_path)
++
++    if not file_descriptions:
++        log.info(f'inject_document: 0/{len(doc_files)} documents resolved')
++        return form_data
++
++    file_context = ''.join(file_descriptions)
++    content = latest_user_msg.get('content', '')
++    if isinstance(content, list):
++        latest_user_msg['content'] = [{'type': 'text', 'text': file_context}] + content
++    else:
++        if content:
++            latest_user_msg['content'] = file_context + str(content)
++        else:
++            latest_user_msg['content'] = (
++                '[No text — use read_file to view attached file(s)]\n\n' + file_context
++            )
++
++    log.info(
++        f'inject_document: injected {len(resolved_paths)} path(s) into user message: {resolved_paths}'
++    )
++    return form_data
++
++
+ async def convert_url_images_to_base64(form_data, user=None):
+     messages = form_data.get('messages', [])
+ 
+@@ -2230,12 +2797,21 @@
+             form_data['messages'] = [system_message, *db_messages] if system_message else db_messages
+ 
+             # Inject image files into content as image_url parts (mirrors frontend logic)
++            # Hermes custom: also harvest non-image attachments into form_data['files']
++            # so inject_document_file_paths can see them after message.files is stripped.
++            harvested_docs: list[dict] = []
+             for message in form_data['messages']:
++                raw_files = message.get('files', []) or []
+                 image_files = [
+                     f
+-                    for f in message.get('files', [])
++                    for f in raw_files
+                     if f.get('type') == 'image' or (f.get('content_type') or '').startswith('image/')
+                 ]
++                for f in raw_files:
++                    if isinstance(f, dict) and not (
++                        f.get('type') == 'image' or (f.get('content_type') or '').startswith('image/')
++                    ):
++                        harvested_docs.append(f)
+                 if message.get('role') == 'user' and image_files:
+                     text_content = message.get('content', '')
+                     if isinstance(text_content, str):
+@@ -2250,9 +2826,39 @@
+                                 if f.get('url')
+                             ],
+                         ]
+-                # Strip files field — it's been incorporated into content
++                # Strip files field — images incorporated into content; docs harvested above
+                 message.pop('files', None)
+ 
++            if harvested_docs:
++                existing = form_data.get('files')
++                if not isinstance(existing, list):
++                    existing = []
++                # Dedupe by id
++                seen_ids = {str(f.get('id') or f.get('url')) for f in existing if isinstance(f, dict)}
++                for f in harvested_docs:
++                    key = str(f.get('id') or f.get('url') or '')
++                    if key and key in seen_ids:
++                        continue
++                    if key:
++                        seen_ids.add(key)
++                    existing.append(f)
++                form_data['files'] = existing
++                # Keep early metadata.files in sync if already present
++                if isinstance(form_data.get('metadata'), dict):
++                    meta_files = form_data['metadata'].get('files')
++                    if not isinstance(meta_files, list):
++                        meta_files = []
++                    meta_seen = {str(f.get('id') or f.get('url')) for f in meta_files if isinstance(f, dict)}
++                    for f in harvested_docs:
++                        key = str(f.get('id') or f.get('url') or '')
++                        if key and key in meta_seen:
++                            continue
++                        if key:
++                            meta_seen.add(key)
++                        meta_files.append(f)
++                    form_data['metadata']['files'] = meta_files
++                    log.info(f'harvested {len(harvested_docs)} non-image attachment(s) from DB messages')
++
+     if regeneration_prompt:
+         form_data['messages'].append({'role': 'user', 'content': regeneration_prompt})
+ 
+@@ -2304,8 +2910,16 @@
+         except Exception:
+             pass
+ 
++    # Inject image file paths BEFORE convert_url_images_to_base64
++    # This replaces image_url parts with local file paths for the Hermes agent
++    form_data = await inject_image_file_paths(form_data, user=user)
+     form_data = await convert_url_images_to_base64(form_data, user=user)
+ 
++    # NOTE: inject_document_file_paths runs later — after metadata['files'] is
++    # finalized (see just before chat_completion_files_handler) — because in
++    # 0.10.x top-level files are only copied onto metadata near the end of
++    # process_chat_payload. Running too early sees an empty file list.
++
+     event_emitter = await get_event_emitter(metadata)
+     event_caller = await get_event_call(metadata)
+ 
+@@ -2450,7 +3064,7 @@
+                     form_data['messages'],
+                 )
+ 
+-        if 'memory' in features and features['memory'] and await Config.get('memories.system_context.enable'):
++        if 'memory' in features and features['memory']:
+             form_data = await add_memory_context(request, form_data, user, model)
+ 
+         if 'web_search' in features and features['web_search']:
+@@ -2780,6 +3394,16 @@
+     # Check if file context extraction is enabled for this model (default True)
+     file_context_enabled = (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get('file_context', True)
+ 
++    # Hermes custom: inject document local paths and strip them from metadata
++    # BEFORE native RAG (chat_completion_files_handler) so the model gets a
++    # path + read_file hint instead of (or in addition to empty) extracted text.
++    try:
++        form_data = await inject_document_file_paths(form_data, user=user)
++        # Keep metadata alias in sync — inject mutates form_data['metadata']
++        metadata = form_data.get('metadata', metadata)
++    except Exception:
++        log.exception('inject_document_file_paths failed')
++
+     if file_context_enabled:
+         try:
+             form_data, flags = await chat_completion_files_handler(request, form_data, extra_params, user)
+@@ -3075,12 +3699,9 @@
+ 
+         messages = []
+         for message in message_list:
+-            content = message.get('content', '')
+-            if isinstance(content, list):
+-                for item in content:
+-                    if item.get('type') == 'text':
+-                        content = item['text']
+-                        break
++            content = get_content_from_message(message)
++            if content is None:
++                content = ''
+ 
+             if isinstance(content, str):
+                 content = re.sub(
