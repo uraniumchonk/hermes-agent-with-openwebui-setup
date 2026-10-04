@@ -1,5 +1,5 @@
---- /home/user/owui-migration/patches/middleware.official.0.10.2.py	2026-08-06 19:22:55.935134304 +0800
-+++ /home/user/openwebui/lib/python3.12/site-packages/open_webui/utils/middleware.py	2026-08-06 19:36:24.344860187 +0800
+--- ~/owui-migration/patches/middleware.official.0.10.2.py	2026-08-06 19:22:55.935134304 +0800
++++ ~/openwebui/lib/python3.12/site-packages/open_webui/utils/middleware.py	2026-08-06 19:36:24.344860187 +0800
 @@ -7,11 +7,15 @@
  import logging
  import os
@@ -55,10 +55,10 @@
 +
 +# --- File cache + path injection for Hermes agent ---
 +# Supports: images (vision_analyze) + documents (read_file)
-+IMAGE_CACHE_DIR = Path('/home/user/openwebui/data/image_cache')
++IMAGE_CACHE_DIR = Path.home() / 'openwebui/data/image_cache'
 +IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 +
-+FILE_CACHE_DIR = Path('/home/user/openwebui/data/file_cache')
++FILE_CACHE_DIR = Path.home() / 'openwebui/data/file_cache'
 +FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 +
 +from datetime import datetime

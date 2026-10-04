@@ -1,5 +1,5 @@
---- /home/user/owui-migration/patches/misc.official.0.10.2.py	2026-08-06 19:22:56.272136092 +0800
-+++ /home/user/openwebui/lib/python3.12/site-packages/open_webui/utils/misc.py	2026-08-02 15:04:07.829254662 +0800
+--- ~/owui-migration/patches/misc.official.0.10.2.py	2026-08-06 19:22:56.272136092 +0800
++++ ~/openwebui/lib/python3.12/site-packages/open_webui/utils/misc.py	2026-08-02 15:04:07.829254662 +0800
 @@ -164,7 +164,24 @@
              if item['type'] == 'text':
                  return item['text']

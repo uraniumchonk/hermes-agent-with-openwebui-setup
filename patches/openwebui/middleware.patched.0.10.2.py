@@ -1939,10 +1939,10 @@ def apply_params_to_form_data(form_data, model):
 
 # --- File cache + path injection for Hermes agent ---
 # Supports: images (vision_analyze) + documents (read_file)
-IMAGE_CACHE_DIR = Path('/home/user/openwebui/data/image_cache')
+IMAGE_CACHE_DIR = Path.home() / 'openwebui/data/image_cache'
 IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-FILE_CACHE_DIR = Path('/home/user/openwebui/data/file_cache')
+FILE_CACHE_DIR = Path.home() / 'openwebui/data/file_cache'
 FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 from datetime import datetime
